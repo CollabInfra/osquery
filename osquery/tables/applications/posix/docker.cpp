@@ -18,6 +18,7 @@
 #include <boost/asio.hpp>
 #include <boost/foreach.hpp>
 #include <boost/property_tree/json_parser.hpp>
+#include <boost/filesystem.hpp>
 
 #if !defined(BOOST_ASIO_HAS_LOCAL_SOCKETS)
 #error Boost error: Local sockets not available
@@ -29,6 +30,9 @@
 #include <osquery/utils/conversions/join.h>
 #include <osquery/utils/info/platform_type.h>
 #include <osquery/utils/json/json.h>
+#include <osquery/filesystem/filesystem.h>
+#include <osquery/filesystem/fileops.h>
+#include <osquery/hashing/hashing.h>
 
 // When building on linux, the extended schema of docker_containers will
 // add some additional columns to support user namespaces
@@ -55,6 +59,201 @@ FLAG(string,
 namespace tables {
 
 /**
+ * @brief Get potential user home directories based on the platform.
+ *
+ * @return Vector of potential home directory paths.
+ */
+std::vector<boost::filesystem::path> getPotentialHomeDirectories() {
+  std::vector<boost::filesystem::path> home_dirs;
+  
+  // Add current user's home directory if available
+  auto current_home = getHomeDirectory();
+  if (current_home) {
+    home_dirs.push_back(*current_home);
+  }
+
+#ifdef WIN32
+  // Windows: Check C:\Users\*
+  boost::filesystem::path users_dir("C:\\Users");
+  if (boost::filesystem::exists(users_dir) && 
+      boost::filesystem::is_directory(users_dir)) {
+    try {
+      for (const auto& entry : boost::filesystem::directory_iterator(users_dir)) {
+        if (boost::filesystem::is_directory(entry)) {
+          home_dirs.push_back(entry.path());
+        }
+      }
+    } catch (const boost::filesystem::filesystem_error& e) {
+      VLOG(1) << "Error iterating Windows user directories: " << e.what();
+    }
+  }
+#else
+  // Unix-like: Check /home/* and /Users/*
+  std::vector<std::string> base_dirs = {"/home", "/Users"};
+  for (const auto& base : base_dirs) {
+    boost::filesystem::path base_dir(base);
+    if (boost::filesystem::exists(base_dir) && 
+        boost::filesystem::is_directory(base_dir)) {
+      try {
+        for (const auto& entry : boost::filesystem::directory_iterator(base_dir)) {
+          if (boost::filesystem::is_directory(entry)) {
+            home_dirs.push_back(entry.path());
+          }
+        }
+      } catch (const boost::filesystem::filesystem_error& e) {
+        VLOG(1) << "Error iterating user directories in " << base << ": " << e.what();
+      }
+    }
+  }
+#endif
+
+  return home_dirs;
+}
+
+/**
+ * @brief Compute SHA256 hash of a string.
+ *
+ * @param input The string to hash.
+ * @return SHA256 hash as hex string.
+ */
+std::string computeSHA256(const std::string& input) {
+  return hashFromBuffer(HASH_TYPE_SHA256, input.c_str(), input.length());
+}
+
+/**
+ * @brief Discover Docker socket path from Docker context configuration.
+ *
+ * This function searches for Docker context configuration in user home
+ * directories and extracts the socket path from the current context's
+ * metadata.
+ *
+ * @return Docker socket path if found, otherwise empty string.
+ */
+std::string discoverDockerSocketFromContext() {
+  auto home_dirs = getPotentialHomeDirectories();
+  
+  for (const auto& home_dir : home_dirs) {
+    boost::filesystem::path config_path = home_dir / ".docker" / "config.json";
+    
+    // Check if config.json exists
+    if (!boost::filesystem::exists(config_path)) {
+      continue;
+    }
+    
+    // Read and parse config.json
+    std::string config_content;
+    Status read_status = readFile(config_path, config_content, false);
+    if (!read_status.ok()) {
+      VLOG(1) << "Error reading Docker config at " << config_path.string() 
+              << ": " << read_status.what();
+      continue;
+    }
+    
+    pt::ptree config_tree;
+    try {
+      std::istringstream config_stream(config_content);
+      pt::read_json(config_stream, config_tree);
+    } catch (const pt::ptree_error& e) {
+      VLOG(1) << "Error parsing Docker config JSON at " << config_path.string() 
+              << ": " << e.what();
+      continue;
+    }
+    
+    // Get current context name
+    std::string current_context = config_tree.get<std::string>("currentContext", "");
+    if (current_context.empty()) {
+      VLOG(1) << "No current context found in " << config_path.string();
+      continue;
+    }
+    
+    // Compute SHA256 hash of context name
+    std::string context_hash = computeSHA256(current_context);
+    
+    // Build path to context metadata
+    boost::filesystem::path meta_path = home_dir / ".docker" / "contexts" / 
+                                        "meta" / context_hash / "meta.json";
+    
+    // Check if meta.json exists
+    if (!boost::filesystem::exists(meta_path)) {
+      VLOG(1) << "Context metadata not found at " << meta_path.string();
+      continue;
+    }
+    
+    // Read and parse meta.json
+    std::string meta_content;
+    read_status = readFile(meta_path, meta_content, false);
+    if (!read_status.ok()) {
+      VLOG(1) << "Error reading context metadata at " << meta_path.string() 
+              << ": " << read_status.what();
+      continue;
+    }
+    
+    pt::ptree meta_tree;
+    try {
+      std::istringstream meta_stream(meta_content);
+      pt::read_json(meta_stream, meta_tree);
+    } catch (const pt::ptree_error& e) {
+      VLOG(1) << "Error parsing context metadata JSON at " << meta_path.string() 
+              << ": " << e.what();
+      continue;
+    }
+    
+    // Extract Docker endpoint host
+    std::string docker_host = meta_tree.get<std::string>("Endpoints.docker.Host", "");
+    if (docker_host.empty()) {
+      VLOG(1) << "No Docker endpoint found in context metadata at " 
+              << meta_path.string();
+      continue;
+    }
+    
+    // Parse the host to extract socket path
+    // Docker host format: unix:///var/run/docker.sock or npipe:////./pipe/docker_engine
+    if (boost::starts_with(docker_host, "unix://")) {
+      std::string socket_path = docker_host.substr(7); // Remove "unix://"
+      VLOG(1) << "Discovered Docker socket from context '" << current_context 
+              << "': " << socket_path;
+      return socket_path;
+    } else if (boost::starts_with(docker_host, "npipe://")) {
+      // Windows named pipe
+      std::string pipe_path = docker_host.substr(8); // Remove "npipe://"
+      VLOG(1) << "Discovered Docker named pipe from context '" << current_context 
+              << "': " << pipe_path;
+      return pipe_path;
+    } else {
+      VLOG(1) << "Unsupported Docker host format in context '" << current_context 
+              << "': " << docker_host;
+    }
+  }
+  
+  return "";
+}
+
+/**
+ * @brief Get the Docker socket path to use for API calls.
+ *
+ * First tries to discover from Docker context, falls back to flag value.
+ *
+ * @return Docker socket path.
+ */
+std::string getDockerSocket() {
+  static std::string cached_socket;
+  static bool discovered = false;
+  
+  if (!discovered) {
+    discovered = true;
+    cached_socket = discoverDockerSocketFromContext();
+    
+    if (cached_socket.empty()) {
+      VLOG(1) << "Could not discover Docker socket from context, using flag value: " 
+              << FLAGS_docker_socket;
+      cached_socket = FLAGS_docker_socket;
+    }
+  }
+  
+  return cached_socket;
+}
+
+/**
  * @brief Makes API calls to the docker UNIX socket.
  *
  * @param uri Relative URI to invoke GET HTTP method.
@@ -66,7 +265,8 @@ Status dockerApi(const std::string& uri, pt::ptree& tree) {
   static const std::regex httpOkRegex("HTTP/1\\.(0|1) 200 OK\\\r");
 
   try {
-    local::stream_protocol::endpoint ep(FLAGS_docker_socket);
+    std::string docker_socket = getDockerSocket();
+    local::stream_protocol::endpoint ep(docker_socket);
     local::stream_protocol::iostream stream(ep);
     if (!stream) {
       return Status(
