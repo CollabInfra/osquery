@@ -27,10 +27,6 @@
 #include <osquery/worker/ipc/platform_table_container_ipc.h>
 #include <osquery/worker/logging/glog/glog_logger.h>
 
-#ifdef WIN32
-#include "windows/registry.h"
-#endif
-
 namespace fs = boost::filesystem;
 
 namespace osquery {
@@ -71,13 +67,8 @@ struct UserPath {
       : type(Type::String), stringValue(std::move(value)) {}
 };
 
-std::string extractAuthorFromPom(const std::string& content) {
+std::string extractAuthorFromPom(const boost::property_tree::ptree& pt) {
   try {
-    // Parse the XML content into a property tree
-    boost::property_tree::ptree pt;
-    std::istringstream stream(content);
-    boost::property_tree::read_xml(stream, pt);
-
     std::string fallbackAuthor;
 
     // Navigate to the developers section
@@ -134,11 +125,8 @@ std::string extractAuthorFromPom(const std::string& content) {
     }
 
     return fallbackAuthor;
-  } catch (const boost::property_tree::xml_parser_error& e) {
-    // Failed to parse XML, return empty string
-    return "";
   } catch (const std::exception& e) {
-    // Other errors, return empty string
+    // Error accessing ptree, return empty string
     return "";
   }
 }
@@ -160,26 +148,34 @@ void genMavenPackage(const std::string& versionPath,
   std::string content;
   auto s = readFile(pomPath, content);
   if (s.ok()) {
-    // Extract basic info from POM (simplified parsing)
-    // In a real implementation, you'd use an XML parser
-    size_t descStart = content.find("<description>");
-    size_t descEnd = content.find("</description>");
-    if (descStart != std::string::npos && descEnd != std::string::npos) {
-      descStart += 13; // length of "<description>"
-      r["summary"] = content.substr(descStart, descEnd - descStart);
-    }
+    try {
+      // Parse the XML content using Boost::PropertyTree
+      boost::property_tree::ptree pt;
+      std::istringstream stream(content);
+      boost::property_tree::read_xml(stream, pt);
 
-    size_t licenseStart = content.find("<name>", content.find("<license>"));
-    size_t licenseEnd = content.find("</name>", licenseStart);
-    if (licenseStart != std::string::npos && licenseEnd != std::string::npos) {
-      licenseStart += 6; // length of "<name>"
-      r["license"] = content.substr(licenseStart, licenseEnd - licenseStart);
-    }
+      // Extract description
+      auto description = pt.get_optional<std::string>("project.description");
+      if (description) {
+        r["summary"] = *description;
+      }
 
-    // Extract author from developers block
-    std::string author = extractAuthorFromPom(content);
-    if (!author.empty()) {
-      r["author"] = author;
+      // Extract license name
+      auto license =
+          pt.get_optional<std::string>("project.licenses.license.name");
+      if (license) {
+        r["license"] = *license;
+      }
+
+      // Extract author from developers block
+      std::string author = extractAuthorFromPom(pt);
+      if (!author.empty()) {
+        r["author"] = author;
+      }
+    } catch (const boost::property_tree::xml_parser_error& e) {
+      // Failed to parse XML, skip metadata extraction
+    } catch (const std::exception& e) {
+      // Other errors, skip metadata extraction
     }
   }
 }
@@ -260,36 +256,43 @@ void genGradlePackage(const std::string& versionPath,
       if (listFilesInDirectory(hashDir, files, false).ok()) {
         for (const auto& file : files) {
           if (boost::algorithm::ends_with(file, ".pom")) {
-            // Found POM file, parse it for metadata
+            // Found POM file, parse it for metadata using Boost::PropertyTree
             std::string content;
             auto s = readFile(file, content);
             if (s.ok()) {
-              // Extract description
-              size_t descStart = content.find("<description>");
-              size_t descEnd = content.find("</description>");
-              if (descStart != std::string::npos &&
-                  descEnd != std::string::npos) {
-                descStart += 13;
-                r["summary"] = content.substr(descStart, descEnd - descStart);
-              } else {
+              try {
+                // Parse the XML content using Boost::PropertyTree
+                boost::property_tree::ptree pt;
+                std::istringstream stream(content);
+                boost::property_tree::read_xml(stream, pt);
+
+                // Extract description
+                auto description =
+                    pt.get_optional<std::string>("project.description");
+                if (description) {
+                  r["summary"] = *description;
+                } else {
+                  r["summary"] = groupId + ":" + artifactId;
+                }
+
+                // Extract license name
+                auto license = pt.get_optional<std::string>(
+                    "project.licenses.license.name");
+                if (license) {
+                  r["license"] = *license;
+                }
+
+                // Extract author from developers block
+                std::string author = extractAuthorFromPom(pt);
+                if (!author.empty()) {
+                  r["author"] = author;
+                }
+              } catch (const boost::property_tree::xml_parser_error& e) {
+                // Failed to parse XML, use fallback
                 r["summary"] = groupId + ":" + artifactId;
-              }
-
-              // Extract license
-              size_t licenseStart =
-                  content.find("<name>", content.find("<license>"));
-              size_t licenseEnd = content.find("</name>", licenseStart);
-              if (licenseStart != std::string::npos &&
-                  licenseEnd != std::string::npos) {
-                licenseStart += 6;
-                r["license"] =
-                    content.substr(licenseStart, licenseEnd - licenseStart);
-              }
-
-              // Extract author from developers block
-              std::string author = extractAuthorFromPom(content);
-              if (!author.empty()) {
-                r["author"] = author;
+              } catch (const std::exception& e) {
+                // Other errors, use fallback
+                r["summary"] = groupId + ":" + artifactId;
               }
             }
             // Only parse the first POM found
@@ -508,6 +511,20 @@ QueryData genJavaPackagesImpl(QueryContext& context, Logger& logger) {
       for (const auto& site : sites) {
         paths.insert(site);
       }
+    }
+  }
+
+  // Enumerate packages in the specified directories
+  for (const auto& path : paths) {
+    // Determine the type of repository based on the path
+    if (path.find(".m2/repository") != std::string::npos or
+        path.find(".m2\\repository") != std::string::npos) {
+      // Maven repository
+      genMavenArtifacts(path, results, logger, 0);
+    } else if (path.find(".gradle/caches") != std::string::npos or
+               path.find(".gradle\\caches") != std::string::npos) {
+      // Gradle cache
+      genGradleArtifacts(path, results, logger, 0);
     }
   }
 

@@ -39,14 +39,14 @@ class javaPackages : public testing::Test {
 
 TEST_F(javaPackages, test_sanity) {
   ValidationMap row_map = {
-      {"name", NormalType},
+      {"name", NonEmptyString},
       {"uid", IntType},
       {"version", NormalType},
       {"summary", NormalType},
       {"author", NormalType},
       {"license", NormalType},
-      {"path", NormalType},
-      {"directory", NormalType},
+      {"path", FileOnDisk},
+      {"directory", DirectoryOnDisk},
       {"type", NormalType},
   };
 
